@@ -22,8 +22,20 @@ Python-резолвер подсистемы загрузки LTX/DLTX движ�
 import os
 import re
 from collections import OrderedDict
+from enum import Enum
 
-DLTX_DELETE = "DLTX_DELETE"          # Xr_ini.cpp:465
+
+class DLTXToken(Enum):
+    """Служебные токены значений. В движке DLTX_DELETE — interned shared_str
+    (Xr_ini.cpp:465), сравнение o_it->second == DLTX_DELETE идёт по указателю
+    str_value* (xrstring.h:182), поэтому коллизии с реальными значениями
+    физически невозможны. В Python моделируем это отдельным типом Enum,
+    чтобы строка "DLTX_DELETE" в конфиге не могла быть спутана с токеном."""
+    DELETE = "DELETE"                # !key = (Xr_ini.cpp:867)
+    EMPTY = "EMPTY"                  # 'key =' без значения -> движковский NULL
+
+
+DLTX_DELETE = DLTXToken.DELETE       # Xr_ini.cpp:465
 MOD_DEPTH_STEP = -200                # Xr_ini.cpp:570-571, 611
 
 
@@ -52,7 +64,8 @@ def pattern_match(name, mask):
     LocatorAPI.cpp:1030-1041). Регистронезависимо: имена файлов в FS_FileSet
     приводятся к lower-case (LocatorAPI_defs.h:63 'low-case name').
     """
-    rx = "^" + "".join(".*" if c == "*" else re.escape(c) for c in mask.lower()) + "$"
+    rx = "^" + "".join(".*" if c == "*" else "." if c == "?" else re.escape(c)
+                       for c in mask.lower()) + "$"
     return re.match(rx, name.lower()) is not None
 
 
@@ -271,7 +284,9 @@ class LtxResolver:
         """
         current_base = None
         current_override = None
-        sections_marked_for_create = set()
+        # xr_unordered_flat_set<shared_str> sectionsMarkedForCreate (Xr_ini.cpp:528):
+        # уникальные имена в ПОРЯДКЕ первого добавления (flat-set: find+push_back).
+        sections_marked_for_create = OrderedDict()
 
         lines = self._read_lines(reader_path)
         i = 0
@@ -368,7 +383,7 @@ class LtxResolver:
                 elif is_safe:
                     b_is_override = True
                     if sec_name not in self.base_data:
-                        sections_marked_for_create.add(sec_name)
+                        sections_marked_for_create[sec_name] = True
 
                 sect = Sect(sec_name)
                 if b_is_override:
@@ -415,11 +430,18 @@ class LtxResolver:
                     self._log("~[DLTX] WARNING: Malformed line %s in file %s" %
                               (line, current_file_name[0]))
                     continue
-                item.second = DLTX_DELETE if b_is_delete else (value if value else None)
+                # Xr_ini.cpp:867 I.second = bIsDelete ? DLTX_DELETE : (str2[0] ? str2 : NULL).
+                # Точное соответствие движку: '!' (даже без '=') -> токен DELETE;
+                # строка БЕЗ '=' вообще -> None (в движке это separate if-ветка, 819-857);
+                # 'key =' (пустое после '=') -> "" — непустой указатель shared_str,
+                # НЕ нормализуется к NULL.
+                item.second = (DLTX_DELETE if b_is_delete else value)
                 item.filename = os.path.splitext(current_file_name[0].lower())[0]  # 869-870
                 item.depth = depth
 
-                if item.first or item.second:
+                # Xr_ini.cpp:873 if (*I.first || *I.second): в движке условие всегда
+                # истинно при непустом имени ключа; для пустого имени пропускаем.
+                if item.first or item.second is not None:
                     if current_base is not None:
                         self._insert_item(current_base, Item(item.first, item.second,
                                                              item.filename, depth))
@@ -431,12 +453,20 @@ class LtxResolver:
         self._stash_current_section(current_base, current_override, current_file_name[0])
 
         # ---- пустые секции, помеченные @[, так и не созданные (Xr_ini.cpp:892-905) ----
+        # Движок: CurrentBase = xr_new<Sect>(SecName); BaseData.emplace(...);
+        # OverrideToFilename.insert(currentFileName); SectionToFilename = ...
+        # ВАЖНО: CurrentOverride к этому моменту уже stash-нут (строка 885),
+        # поэтому ключи @[секции оседают только в OverrideData — базовая
+        # секция остаётся ПУСТОЙ; победитель определяется MergeSections.
         for sec_name in sections_marked_for_create:
             if sec_name not in self.base_data:
                 s = Sect(sec_name)
                 self.base_data[sec_name] = s
-                self.override_to_filenames.setdefault(sec_name, []).append(current_file_name[0])
-                self.section_to_filename[sec_name] = current_file_name[0]
+                fnames = self.override_to_filenames.setdefault(sec_name, [])
+                fname = current_file_name[0]
+                if fname not in fnames:                      # std::set insert
+                    fnames.append(fname)
+                self.section_to_filename[sec_name] = fname
 
     # --------------------------------------------------- mod_* autoload
 
@@ -519,14 +549,22 @@ class LtxResolver:
                         is_merging_base_and_mod):
         """
         CInifile::MergeSections (Xr_ini.cpp:908-1002). Оба входа должны быть
-        отсортированы по ключу (как std-векторы после SortAndFilter... нет —
-        здесь это merge двух отсортированных по первому полю последовательностей).
+        отсортированы по ключу (merge двух отсортированных последовательностей).
         Правила:
           * !key (DLTX_DELETE) в override:
               - base+mod  : ключ удаляется совсем (попадает в DeletedItems);
               - parent+base: ключ остаётся со значением из base (защита от
                 удаления унаследованного значения самим родителем).
           * коллизия — побеждает override (значение).
+        Точное соответствие движку (важно!):
+          * o_it->second == DLTX_DELETE — СРАВНЕНИЕ УКАЗАТЕЛЕЙ interned-строк
+            (xrstring.h:182: a._get() == b._get()), т.е. истинно ТОЛЬКО для
+            токена, записанного парсером (Xr_ini.cpp:867). Реальное значение
+            "DLTX_DELETE" из конфига token'ом не является. В Python токен —
+            объект Enum, поэтому 'is DLTX_DELETE'.
+          * xr_strcmp(b_it->first, o_it->first) в движке разыменовывает NULL
+            shared_str (UB/краш при пустом ключе). Мы интерпретируем NULL как
+            "" (xrstring.h:129 c_str() возвращает 0; strcmp-safe обёртки).
         """
         result = []
         b = sorted(base_items, key=lambda it: _key(it.first or ""))
@@ -535,7 +573,7 @@ class LtxResolver:
         while bi < len(b) or oi < len(o):
             if bi == len(b):
                 ov = o[oi]
-                if ov.second == DLTX_DELETE:
+                if ov.second is DLTX_DELETE:
                     if is_merging_base_and_mod:
                         deleted_items.add(ov.first)
                 else:
@@ -551,7 +589,7 @@ class LtxResolver:
                 result.append(b[bi]); bi += 1
             elif cmp > 0:
                 ov = o[oi]
-                if ov.second == DLTX_DELETE:
+                if ov.second is DLTX_DELETE:
                     if is_merging_base_and_mod:
                         deleted_items.add(ov.first)
                 else:
@@ -559,7 +597,7 @@ class LtxResolver:
                 oi += 1
             else:
                 ov = o[oi]
-                if ov.second == DLTX_DELETE:
+                if ov.second is DLTX_DELETE:
                     if is_merging_base_and_mod:
                         deleted_items.add(ov.first)
                     else:
@@ -599,7 +637,11 @@ class LtxResolver:
         resolved_parents = []
         deleted_items = set()
         for parent in (base_parents or []):
-            pname = parent[1:].lower() if parent.startswith("!") else parent.lower()
+            # Xr_ini.cpp:1059-1089: имена родителей используются КАК ЕСТЬ
+            # (без lower()); GetParentsSetFromString/_GetItem не понижают регистр
+            # (xr_trims.cpp:74-81). Родитель "!Name" с заглавной N НЕ совпадёт с
+            # удалителем "name" — воспроизводим это буквально.
+            pname = parent[1:] if parent.startswith("!") else parent
             if pname not in self.base_data:
                 if pname in self.override_data:
                     self._warn("Section '%s' has parent '%s' that is defined as Override. "
@@ -607,10 +649,13 @@ class LtxResolver:
                     s = Sect(pname)
                     self.base_data[pname] = s
                 else:
-                    self._warn("Section '%s' inherits from non-existent section '%s'. "
+                    if self.print_dltx_warnings:
+                        self._warn("Section '%s' inherits from non-existent section '%s'. "
                                "Creating fallback empty parent section." % (section_name, pname))
                     s = Sect(pname)
                     self.base_data[pname] = s
+            # движок: BaseData[parent] создаёт пустую секцию при отсутствии
+            # (operator[]), а EvaluateSection(parent) вызывается ВСЕГДА (1088)
             parent_data = self._evaluate_section(pname, resolved_cache, recursion_stack)
             resolved_parents = self._merge_sections(resolved_parents, parent_data,
                                                     deleted_items, False)
@@ -629,13 +674,20 @@ class LtxResolver:
         # ---- операции > / < над CSV-списками (Xr_ini.cpp:1167-1290) ----
         mods = self.override_modify_list_data.get(section_name)
         if mods:
-            mods_sorted = sorted(mods, key=lambda it: (_key((it.first or "")[1:]),
+            # Xr_ini.cpp:1216-1224: sort by (*a.first)+1 (ключ всегда непустой —
+            # начинается с >/<), затем insertionIndex ASC ("preserve file order",
+            # в отличие от SortAndFilterSection).
+            mods_sorted = sorted(mods, key=lambda it: (_key(it.first[1:]),
                                                        it.insertion_index))
             result = []
             cur = sorted(current_result, key=lambda it: _key(it.first or ""))
             di = mi = 0
             while di < len(cur) or mi < len(mods_sorted):
-                if mi < len(mods_sorted) and mods_sorted[mi].second is None:
+                # Xr_ini.cpp:1233-1237: модификация с ПУСТЫМ значением пропускается.
+                # В движке условие mod_it->second == NULL; у нас NULL-подобные
+                # значения не доходят сюда (парсер пишет "" или токен), поэтому
+                # единственная корректная интерпретация — пропуск токена DELETE.
+                if mi < len(mods_sorted) and mods_sorted[mi].second is DLTX_DELETE:
                     mi += 1
                     continue
                 if mi < len(mods_sorted) and di < len(cur):
@@ -665,6 +717,7 @@ class LtxResolver:
                             exists_in_output = True
                     while mi < len(mods_sorted) and mods_sorted[mi].first[1:] == active_key:
                         m = mods_sorted[mi]
+                        # Xr_ini.cpp:1271: mod_it->second != NULL
                         if exists_in_output and m.second is not None:
                             op = m.first[0]
                             items_vec = self._split_list(working.second)
@@ -721,7 +774,11 @@ class LtxResolver:
             self._sort_and_filter_section(sect)
 
         resolved = {}                                          # 1339-1351
-        for name in list(self.base_data.keys()):
+        # Движок копирует ключи BaseData в RStringVec и обходит его (1344-1352).
+        # BaseData — xr_unordered_flat_map (hash-порядок); детерминированный
+        # аналог в Python — sorted по имени (секции независимо рекурсируют,
+        # результат не зависит от порядка обхода).
+        for name in sorted(list(self.base_data.keys()), key=_key):
             self._evaluate_section(name, resolved, [])
 
         for s in sorted(self.sections_to_delete, key=_key):    # 1354-1370
@@ -802,8 +859,16 @@ class LtxResolver:
 
     @staticmethod
     def _read_lines(path):
+        """Чтение строк файла. Движок читает байты (IReader::r_string);
+        игровые .ltx часто в Windows-1251, поэтому: сначала UTF-8 строго,
+        при UnicodeDecodeError — cp1251 с заменой; BOM снимается."""
         with open(path, "rb") as f:
             raw = f.read()
-        text = raw.decode("utf-8", errors="replace")
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("windows-1251", errors="replace")
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         return text.split("\n")
