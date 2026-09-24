@@ -1,0 +1,24 @@
+; root file
+#include "includes\core.ltx"
+#include "includes\*.ltx"
+
+[sup]
+a = 1
+b = 2
+list = one, two
+
+![sup]
+b = 20
+
+[dup]
+x = from_root
+
+!![gone]
+
+[gone]
+dead = 1
+
+@[safe_new]
+
+[child:sup]
+c = 3
