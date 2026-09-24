@@ -347,17 +347,19 @@ class LtxResolver:
                 current_base = current_override = None
 
                 start = 2 if (is_override or is_safe) else 1
-                # SecName = substr(start, strchr(str,']')-str-start) (Xr_ini.cpp:750-751).
-                # Для "[name:parents]" strchr находит ПЕРВЫЙ ']', поэтому движок
-                # делает имя секции ВМЕСТЕ с хвостом ":parents" (особенность/квирк
-                # DLTX-парсера); для ![ / @[ хвост ":..." в имя не попадает.
-                close_bracket = line.find("]")
+                # SecName = substr(start, strchr(str,']')-str-start), lower (Xr_ini.cpp:750-756).
+                # ВНИМАНИЕ (квирк движка): strchr находит ПЕРВЫЙ ']', поэтому для
+                # base-секции "[name:parent]" хвост ":parent" остаётся ЧАСТЬЮ имени
+                # секции (BaseData key = "child:sup"), а наследование отдельно
+                # распознаётся через strstr(str, "]:") (Xr_ini.cpp:785-808).
+                # Для override ("![", "@[") используется !isModSection(&str[2])
+                # (xrstring.h:393-396) — первый ']' ПОСЛЕ позиции 2, т.е. закрывающая
+                # скобка, и хвост ":..." в имя не попадает.
+                close_bracket = line.find("]", 2) if (is_override or is_safe) \
+                    else line.find("]")
                 if close_bracket == -1:
                     raise RuntimeError("Bad ini section found: %s" % line)   # Xr_ini.cpp:784
-                inherit_pos = line.find(":", close_bracket)
-                name_end = len(line) if (inherit_pos != -1 and not (is_override or is_safe)) \
-                    else close_bracket
-                sec_full = line[start:name_end]
+                sec_full = line[start:close_bracket]
                 sec_name = sec_full.lower()
 
                 b_is_override = False
@@ -374,10 +376,12 @@ class LtxResolver:
                 else:
                     current_base = sect
 
-                # наследование: ]:parent,parent,... (Xr_ini.cpp:786-808)
-                inherited = line[close:].find(":")
-                if line[close:].startswith(":"):
-                    parents_str = line[close + 1:]
+                # наследование: strstr(str, "]:") — ТОЛЬКО непосредственно "]" + ":"
+                # (Xr_ini.cpp:785-808). Хвост ":parents" при этом остаётся частью
+                # имени секции (квирк substr/strchr, строка 751) — см. выше.
+                inherit_pos = line.find("]:")
+                if inherit_pos != -1:
+                    parents_str = line[inherit_pos + 2:]
                     parents = [_trim(_get_item(parents_str, k)).lower()
                                for k in range(_get_item_count(parents_str))]
                     parents = [p for p in parents if p]
