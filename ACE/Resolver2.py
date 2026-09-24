@@ -264,13 +264,17 @@ class LtxResolver:
           1) CurrentBase != NULL: дубликат base -> Debug.fatal (374-378);
              иначе emplace + SectionToFilename (380-384).
           2) CurrentOverride != NULL (386-407):
-             a) OverrideData уже есть -> MergeVector + InsertIntoMap(
-                OverrideToFilename, sectionName, currentFileName) (390-397);
-             b) иначе -> insert(override) и ЕСЛИ BaseData ещё нет —
-                предупреждение 'Attempted to override ...' +
-                InsertIntoMap(OverrideToFilename, ...) (398-405).
-           Предупреждение привязано к ФАКТУ ОТСУТСТВИЯ BASE НА МОМЕНТ СЛЭША,
-           а не к наличию ключа в OverrideToFilename."""
+             a) OverrideData уже есть -> merge существующей override-секции
+                текущими items + OverrideToFilename[section].insert(currentFileName);
+             b) иначе -> emplace(override) +
+                OverrideToFilename[section].insert(currentFileName).
+           ВАЖНО: в StashCurrentSection НЕТ печати 'Attempted to override...'.
+           Это предупреждение генерируется только в финальном проходе LTXLoad
+           (Xr_ini.cpp:1384-1402), обёрнутом в if (print_dltx_warnings):
+           для каждой оставшейся записи OverrideData (т.е. секций, которые так и
+           не были разрешены EvaluateSection / SectionsToDelete) печатается по
+           одному сообщению на КАЖДЫЙ файл из OverrideToFilename[k] (вложенный
+           цикл), а не «ровно одно на слэш». См. _ltx_load / load()."""
         if current_base is not None:
             existing = self.base_data.get(current_base.name)
             if existing is not None:
@@ -289,20 +293,20 @@ class LtxResolver:
         if current_override is not None:
             existing = self.override_data.get(current_override.name)
             if existing is not None:
-                for it in current_override.data:      # MergeVector (xr_vector.h:196)
+                # Xr_ini.cpp:388-397: слияние items в УЖЕ существующую
+                # OverrideData-запись + регистрация файла.
+                # (В текущем движке здесь НЕ 'MergeVector', а цикл
+                #  insert_item по каждому Item.)
+                for it in current_override.data:
                     self._insert_item(existing, it)
                 self._insert_into_map(self.override_to_filenames,
                                       existing.name, current_file_name)
             else:
+                # Xr_ini.cpp:398-405: emplace + регистрация файла.
+                # Печати предупреждений здесь НЕТ — см. докстринг выше.
                 self.override_data[current_override.name] = current_override
-                if current_override.name not in self.base_data:   # BaseData.find==end
-                    self._warn("Attempted to override section '%s', which doesn't "
-                               "exist. Ensure that a base section with the same "
-                               "name is loaded first. Check %s, mod file %s" % (
-                                   current_override.name, self.file_name,
-                                   current_file_name))
-                    self._insert_into_map(self.override_to_filenames,
-                                          current_override.name, current_file_name)
+                self._insert_into_map(self.override_to_filenames,
+                                      current_override.name, current_file_name)
 
     @staticmethod
     def _insert_into_map(mp, key, fname):
@@ -932,10 +936,24 @@ class LtxResolver:
         if self.use_cache and self.file_name:                  # 1375-1381
             self._cache[cache_key] = self.data
 
-        # ВНИМАНИЕ: финального прохода с предупреждениями в движке НЕТ.
-        # 'Attempted to override...' печатается ровно один раз за слэш секции
-        # в StashCurrentSection (Xr_ini.cpp:400-404) — см. выше.
-        # cleanup (1402-1419)
+        # Handle override warnings — финальный проход LTXLoad
+        # (Xr_ini.cpp:1384-1402), обёрнут в if (print_dltx_warnings).
+        # Печатается ПО ОДНОМУ сообщению на КАЖДЫЙ файл из OverrideToFilename[k]
+        # для каждой секции, оставшейся в OverrideData (т.е. override без base;
+        # унаследованные overrides удаляются в EvaluateSection, !![sec] — в
+        # проходе SectionsToDelete). В StashCurrentSection такой печати НЕТ.
+        if self.override_data:
+            if self.print_dltx_warnings:
+                for k in sorted(self.override_data.keys(), key=_key):
+                    filenames = self.override_to_filenames.get(k, [])
+                    for fname in filenames:
+                        self._warn("Attemped to override section '%s', which "
+                                   "doesn't exist. Ensure that a base section "
+                                   "with the same name is loaded first. Check "
+                                   "this file and its DLTX mods: %s, mod file %s"
+                                   % (k, self.file_name, fname))
+
+        # cleanup (1404-1421)
         self.override_to_filenames.clear()
         self.section_to_filename.clear()
         self.sections_to_delete.clear()
