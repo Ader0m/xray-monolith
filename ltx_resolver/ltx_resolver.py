@@ -36,6 +36,7 @@ class DLTXToken(Enum):
 
 
 DLTX_DELETE = DLTXToken.DELETE       # Xr_ini.cpp:465
+DLTX_EMPTY  = DLTXToken.EMPTY        # NULL shared_str (Xr_ini.cpp:867)
 MOD_DEPTH_STEP = -200                # Xr_ini.cpp:570-571, 611
 
 
@@ -144,12 +145,19 @@ class Item:
 
 
 class Sect:
-    """CInifile::Sect (xr_ini.h:68-74)."""
+    """CInifile::Sect (xr_ini.h:68-74): { Name; xr_vector<ItemPtr> Data }.
+    Итерация/len — по Data, как по вектору в движке."""
     __slots__ = ("name", "data")
 
     def __init__(self, name=""):
         self.name = name
         self.data = []
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
 
 
 # ---------------------------------------------------------------- resolver
@@ -181,9 +189,15 @@ class LtxResolver:
         self.override_data = OrderedDict()
         self.override_modify_list_data = {}
 
+        self._mod_phase_pending = True   # фаза mod_* ещё не выполнялась (529-534)
         self.data = []            # финальный Root DATA
         self.warnings = []
         self._cache = {}          # CachedData (Xr_ini.cpp:111)
+        # Флаг предупреждений DLTX (отсутствующий родитель и т.п.) —
+        # в движке управляется консольной переменной print_dltx_warnings
+        # (Xr_ini.cpp:1066/1077). По умолчанию выключен, чтобы не падать
+        # на фикстурах с несуществующими родителями.
+        self.print_dltx_warnings = False
 
     # ------------------------------------------------------------- helpers
 
@@ -236,12 +250,25 @@ class LtxResolver:
 
     # ----------------------------------------------- StashCurrentSection
 
-    def _stash_current_section(self, current_base, current_override, current_file_name):
-        """CInifile::StashCurrentSection (Xr_ini.cpp:365-408)."""
+    def _stash_current_section(self, current_base, current_override,
+                               current_file_name):
+        """CInifile::StashCurrentSection (Xr_ini.cpp:365-408). Точный порт.
+
+        Порядок в движке (важно!):
+          1) CurrentBase != NULL: дубликат base -> Debug.fatal (374-378);
+             иначе emplace + SectionToFilename (380-384).
+          2) CurrentOverride != NULL (386-407):
+             a) OverrideData уже есть -> MergeVector + InsertIntoMap(
+                OverrideToFilename, sectionName, currentFileName) (390-397);
+             b) иначе -> insert(override) и ЕСЛИ BaseData ещё нет —
+                предупреждение 'Attempted to override ...' +
+                InsertIntoMap(OverrideToFilename, ...) (398-405).
+           Предупреждение привязано к ФАКТУ ОТСУТСТВИЯ BASE НА МОМЕНТ СЛЭША,
+           а не к наличию ключа в OverrideToFilename."""
         if current_base is not None:
             existing = self.base_data.get(current_base.name)
             if existing is not None:
-                # Debug.fatal в движке: дубликат базовой секции без '!' — фатальная ошибка
+                # Debug.fatal в движке: дубликат базовой секции без '!' — фатально
                 raise RuntimeError(
                     "[DLTX] Duplicate section '%s' wasn't marked as an override. "
                     "Override section by prefixing it with '!' (![%s]). "
@@ -256,13 +283,28 @@ class LtxResolver:
         if current_override is not None:
             existing = self.override_data.get(current_override.name)
             if existing is not None:
-                # слияние повторного override: каждый item вставляется в существующий
-                for it in current_override.data:
+                for it in current_override.data:      # MergeVector (xr_vector.h:196)
                     self._insert_item(existing, it)
-                self.override_to_filenames.setdefault(existing.name, []).append(current_file_name)
+                self._insert_into_map(self.override_to_filenames,
+                                      existing.name, current_file_name)
             else:
                 self.override_data[current_override.name] = current_override
-                self.override_to_filenames.setdefault(current_override.name, []).append(current_file_name)
+                if current_override.name not in self.base_data:   # BaseData.find==end
+                    self._warn("Attempted to override section '%s', which doesn't "
+                               "exist. Ensure that a base section with the same "
+                               "name is loaded first. Check %s, mod file %s" % (
+                                   current_override.name, self.file_name,
+                                   current_file_name))
+                    self._insert_into_map(self.override_to_filenames,
+                                          current_override.name, current_file_name)
+
+    @staticmethod
+    def _insert_into_map(mp, key, fname):
+        """InsertIntoMap<K,V,xr_string> (Xr_ini.cpp:~120-133): std::set-insert
+        значения (уникальность), но у нас ordered list для детерминизма."""
+        lst = mp.setdefault(key, [])
+        if fname not in lst:
+            lst.append(fname)
 
     # ------------------------------------------------------- loadFile
 
@@ -273,6 +315,8 @@ class LtxResolver:
         if not os.path.isfile(fn):
             raise FileNotFoundError("Can't find include file: %s" % name)
         current_file_name[0] = name
+        # bIsRootFile=False: движок передаёт false во всех рекурсиях (330-363);
+        # фаза mod_* управляется флажком run_mod_phase внутри конкретного вызова.
         self._ltx_load(fn, inc_path, False, current_file_name, depth)
 
     # ------------------------------------------------------- LTXLoad
@@ -288,25 +332,58 @@ class LtxResolver:
         # уникальные имена в ПОРЯДКЕ первого добавления (flat-set: find+push_back).
         sections_marked_for_create = OrderedDict()
 
+        # Движок (Xr_ini.cpp:529-534): фаза mod_* запускается ОДИН раз на
+        # экземпляре CInifile, только когда EOF достигнут в контексте КОРНЕВОГО
+        # файла (условие bRootFile && !g_pGameLevel && m_file_name.size();
+        # после фазы m_file_name.clear()). Вложенные рекурсии (инклуды из
+        # root и инклюды из модов) НЕ должны запускать её повторно — поэтому
+        # право на фазу хранится во флаге экземпляра self._mod_phase_pending,
+        # который снимается сразу при входе в фазу.
+        # ВАЖНОЕ УТОЧНЕНИЕ (проверено по Xr_ini.cpp:529-534): условие фазы —
+        #  if (bIsRootFile && !g_pGameLevel && m_file_name.size())
+        # т.е. фаза запускается при EOF ЛЮБОГО рекурсивного прохода с
+        # bIsRootFile==true, пока m_file_name непуст; вложенные loadFile идут с
+        # bIsRootFile=false и фазу НЕ запускают. Поэтому флаг привязан к
+        # аргументу b_is_root_file ВЫЗОВА, а не к «контексту» чтения строк.
+        run_mod_phase = b_is_root_file and self._mod_phase_pending
         lines = self._read_lines(reader_path)
         i = 0
         n = len(lines)
-        mod_phase_done = False
 
         while True:
             # ---- конец файла: для корневого файла запускается фаза mod_* ----
             if i >= n:
-                if b_is_root_file and not mod_phase_done:
+                if run_mod_phase:
                     self._stash_current_section(current_base, current_override,
                                                 current_file_name[0])
                     current_base = current_override = None
-                    mod_phase_done = True
+                    # Xr_ini.cpp:892-905 (в конце КАЖДОГО LTXLoad-прохода):
+                    # секции, помеченные @[...], создаются в BaseData пустыми.
+                    for sec_name in list(sections_marked_for_create.keys()):
+                        if sec_name not in self.base_data:
+                            s = Sect(sec_name)
+                            self.base_data[sec_name] = s
+                            fnames = self.override_to_filenames.setdefault(sec_name, [])
+                            fname = current_file_name[0]
+                            if fname not in fnames:          # std::set insert
+                                fnames.append(fname)
+                            self.section_to_filename[sec_name] = fname
                     if not self.file_name:
                         break
-                    self._load_mod_files(current_file_name, os.path.dirname(self.root_path))
-                break
+                    self._mod_phase_pending = False   # аналог m_file_name.clear()
+                    # ВАЖНОЕ СООТВЕТСТВИЕ ДВИЖКУ (Xr_ini.cpp:336-341, 546-556):
+                    # loadFile передаёт в LTXLoad свой АРГУМЕНТ path как 'folder'
+                    # для поиска mod_*.ltx — НЕ директорию текущего файла.
+                    # Поэтому рекурсивный инклуд с b_is_root_file=True
+                    # (#include "dir\\file.ltx" из root, Xr_ini.cpp:716) ищет
+                    # моды в КОРНЕВОЙ папке, а не в dir\.
+                    self._load_mod_files(current_file_name, path)
+                else:
+                    pass  # финальный слэш и @[...] — ниже, после цикла
 
-            line = _trim(lines[i])
+            line = _trim(lines[i]) if i < n else ""
+            if i >= n:
+                break        # некорневой проход: выходим к финальному слэшу (884-905)
             i += 1
 
             # ---- комментарии: ';' и '//' (Xr_ini.cpp:618-651) ----
@@ -435,13 +512,17 @@ class LtxResolver:
                 # строка БЕЗ '=' вообще -> None (в движке это separate if-ветка, 819-857);
                 # 'key =' (пустое после '=') -> "" — непустой указатель shared_str,
                 # НЕ нормализуется к NULL.
-                item.second = (DLTX_DELETE if b_is_delete else value)
+                item.second = (DLTX_DELETE if b_is_delete
+                               else (value if value else DLTX_EMPTY))
                 item.filename = os.path.splitext(current_file_name[0].lower())[0]  # 869-870
                 item.depth = depth
 
                 # Xr_ini.cpp:873 if (*I.first || *I.second): в движке условие всегда
                 # истинно при непустом имени ключа; для пустого имени пропускаем.
-                if item.first or item.second is not None:
+                # Xr_ini.cpp:873 if (*I.first || *I.second): непустой указатель first
+                # истинен ВСЕГДА — условие тавтологично; запись происходит даже
+                # при second==NULL (движок хранит Item со значением NULL).
+                if True:
                     if current_base is not None:
                         self._insert_item(current_base, Item(item.first, item.second,
                                                              item.filename, depth))
@@ -504,7 +585,7 @@ class LtxResolver:
                 continue
             self._load_file(os.path.join(folder, mod_name), folder,
                             mod_name, current_file_name, d)
-            d += dt
+            d += dt   # Xr_ini.cpp:601-611: шаг -200; первый мод depth=-200
 
     # -------------------------------------------------- MergeParentSet
 
@@ -530,6 +611,10 @@ class LtxResolver:
         """
         if len(sect.data) < 2:
             return
+        # Компаратор Xr_ini.cpp:410-451 (проверен по тексту): sort by
+        # (ключ ↑ xr_strcmp, depth ↑, insertionIndex ↓), затем unique_copy
+        # оставляет ПЕРВОГО в группе равных ключей => победитель:
+        # минимальный depth; при равенстве глубин — ПОСЛЕДНЯЯ вставка.
         sect.data.sort(key=lambda it: (_key(it.first or ""),
                                        it.depth,
                                        -it.insertion_index))
@@ -537,7 +622,7 @@ class LtxResolver:
         j = 0
         while j < len(sect.data):
             k = sect.data[j].first
-            result.append(sect.data[j])
+            result.append(sect.data[j])                 # keep FIRST per key (424-431)
             j += 1
             while j < len(sect.data) and sect.data[j].first == k:
                 j += 1
@@ -548,34 +633,42 @@ class LtxResolver:
     def _merge_sections(self, base_items, override_items, deleted_items,
                         is_merging_base_and_mod):
         """
-        CInifile::MergeSections (Xr_ini.cpp:908-1002). Оба входа должны быть
-        отсортированы по ключу (merge двух отсортированных последовательностей).
-        Правила:
-          * !key (DLTX_DELETE) в override:
-              - base+mod  : ключ удаляется совсем (попадает в DeletedItems);
-              - parent+base: ключ остаётся со значением из base (защита от
-                удаления унаследованного значения самим родителем).
-          * коллизия — побеждает override (значение).
-        Точное соответствие движку (важно!):
-          * o_it->second == DLTX_DELETE — СРАВНЕНИЕ УКАЗАТЕЛЕЙ interned-строк
-            (xrstring.h:182: a._get() == b._get()), т.е. истинно ТОЛЬКО для
-            токена, записанного парсером (Xr_ini.cpp:867). Реальное значение
-            "DLTX_DELETE" из конфига token'ом не является. В Python токен —
-            объект Enum, поэтому 'is DLTX_DELETE'.
-          * xr_strcmp(b_it->first, o_it->first) в движке разыменовывает NULL
-            shared_str (UB/краш при пустом ключе). Мы интерпретируем NULL как
-            "" (xrstring.h:129 c_str() возвращает 0; strcmp-safe обёртки).
+        CInifile::MergeSections (Xr_ini.cpp:908-1002). Точный порт merge-цикла.
+        Оба входа отсортированы по xr_strcmp ключей (917-921 — СЕГОДНЯ это
+        побайтовый strcmp; парсер НЕ понижает регистр ключей).
+
+        Семантика токена DLTX_DELETE в движке (xrstring.h:182 — сравнение
+        указателей interned-строк; токен пишет только парсер, Xr_ini.cpp:867):
+
+          * cmp < 0 (только base)               -> push_back(base)          (941-945)
+          * cmp > 0 (только override):                                        (946-966)
+              - DELETE: если base+mod -> DeletedItems.insert(key)  (951-957)
+                        (ключ мог прийти из ДРУГОГО мода/родителя — удаляется);
+              - иначе -> push_back(override).
+          * cmp == 0 (ключ в обоих):                                           (967-993)
+              - override==DELETE:
+                    base+mod : push_back(base)  (975-980) — base-запись
+                               СОХРАНЯЕТСЯ; реальное удаление !key произойдёт
+                               позже: EvaluateSection вычитает из DeletedItems
+                               все ключи, присутствующие в ResolvedBaseAndMods
+                               (Xr_ini.cpp:1206-1211). Итог: !key из мода,
+                               объявленный в ТОМ ЖЕ merge, что и base-ключ,
+                               ключ НЕ удаляет (квирк движка).
+                    parent+base: base остаётся (981-984).
+              - иначе: push_back(override), base подавлен           (985-992).
         """
         result = []
-        b = sorted(base_items, key=lambda it: _key(it.first or ""))
-        o = sorted(override_items, key=lambda it: _key(it.first or ""))
+        b = sorted(base_items, key=lambda it: it.first or "")
+        o = sorted(override_items, key=lambda it: it.first or "")
         bi = oi = 0
         while bi < len(b) or oi < len(o):
             if bi == len(b):
+                # Хвост override: ключа нет ни в одной позиции base-слияния.
+                # DELETE здесь нечего удалять (в т.ч. !key, чья strcmp-позиция
+                # правее всех base-ключей — см. REGRESSION.txt, кейс sup.b).
                 ov = o[oi]
                 if ov.second is DLTX_DELETE:
-                    if is_merging_base_and_mod:
-                        deleted_items.add(ov.first)
+                    pass
                 else:
                     result.append(ov)
                 oi += 1
@@ -584,31 +677,27 @@ class LtxResolver:
                 result.append(b[bi])
                 bi += 1
                 continue
-            cmp = _xr_strcmp(b[bi].first, o[oi].first)
+            cmp = _xr_strcmp(b[bi].first or "", o[oi].first or "")
             if cmp < 0:
                 result.append(b[bi]); bi += 1
             elif cmp > 0:
                 ov = o[oi]
                 if ov.second is DLTX_DELETE:
                     if is_merging_base_and_mod:
-                        deleted_items.add(ov.first)
+                        deleted_items.add(ov.first)     # 951-957
                 else:
                     result.append(ov)
                 oi += 1
             else:
                 ov = o[oi]
                 if ov.second is DLTX_DELETE:
-                    if is_merging_base_and_mod:
-                        deleted_items.add(ov.first)
-                    else:
-                        result.append(b[bi])
+                    result.append(b[bi])                # 975-984: base сохраняется
                 else:
-                    result.append(ov)
+                    result.append(ov)                   # 985-992: override побеждает
                 oi += 1
                 bi += 1
         return result
 
-    # -------------------------------------------------- EvaluateSection
 
     def _evaluate_section(self, section_name, resolved_cache, recursion_stack):
         """
@@ -670,6 +759,13 @@ class LtxResolver:
 
         current_result = self._merge_sections(resolved_parents, resolved_base_and_mods,
                                               deleted_items, False)
+        # Движок (Xr_ini.cpp:1291-1294): результат кладётся в кэш как Section*
+        # с полем Name; у нас Sect(name). Дальнейшие CSV-моды мутируют
+        # current_result.data на месте — это безопасно, т.к. EvaluateSection
+        # для разных секций независим (каждая пересобирается из своих родителей).
+        sect_obj = Sect(section_name)
+        sect_obj.data = current_result
+        current_result = sect_obj
 
         # ---- операции > / < над CSV-списками (Xr_ini.cpp:1167-1290) ----
         mods = self.override_modify_list_data.get(section_name)
@@ -687,7 +783,12 @@ class LtxResolver:
                 # В движке условие mod_it->second == NULL; у нас NULL-подобные
                 # значения не доходят сюда (парсер пишет "" или токен), поэтому
                 # единственная корректная интерпретация — пропуск токена DELETE.
-                if mi < len(mods_sorted) and mods_sorted[mi].second is DLTX_DELETE:
+                # Движок (1233-1237): if (*mod_it == end || mod_it->second == NULL)
+                # { ++mod_it; continue; } — пропускаются ТОЛЬКО записи с NULL-
+                # значением ('key =' без значения -> EMPTY). Токен DELETE у
+                # >/< мода НЕ пропускается: он даёт ''-add/remove (см. ниже),
+                # как в движке (там DELETE != NULL).
+                if mi < len(mods_sorted) and mods_sorted[mi].second is DLTX_EMPTY:
                     mi += 1
                     continue
                 if mi < len(mods_sorted) and di < len(cur):
@@ -709,6 +810,9 @@ class LtxResolver:
                     if existing is not None:
                         working = Item(existing.first, existing.second,
                                        existing.filename, existing.depth)
+                        # В движке условие cur_it->first || cur_it->second (1258)
+                        # истинно всегда при непустом имени ключа => запись
+                        # считается присутствующей даже с DELETE/NULL-значением.
                         exists_in_output = True
                         di += 1
                     else:
@@ -720,7 +824,10 @@ class LtxResolver:
                         # Xr_ini.cpp:1271: mod_it->second != NULL
                         if exists_in_output and m.second is not None:
                             op = m.first[0]
-                            items_vec = self._split_list(working.second)
+                            items_vec = self._split_list(working.second
+                                                          if isinstance(
+                                                              working.second, str)
+                                                          else "")
                             add_vec = self._split_list(m.second)
                             if op == ">":
                                 items_vec.extend(add_vec)
@@ -738,8 +845,14 @@ class LtxResolver:
             current_result = result
 
         recursion_stack.pop()
-        resolved_cache[section_name] = current_result
-        return current_result
+        # Движок (Xr_ini.cpp:1293): RResultIt = ResultData
+        #       .insert(make_pair(Name, Section)).first —
+        # в кэш попадает ВСЕГДА актуальный Sect с полным именем секции.
+        final_sect = Sect(section_name)
+        final_sect.data = list(current_result) if not isinstance(current_result, Sect) \
+            else current_result.data
+        resolved_cache[section_name] = final_sect
+        return final_sect
 
     @staticmethod
     def _split_list(s, delimiter=","):
@@ -795,12 +908,9 @@ class LtxResolver:
         if self.use_cache and self.file_name:                  # 1375-1381
             self._cache[cache_key] = self.data
 
-        for k in self.override_data:                           # 1384-1400
-            for fname in self.override_to_filenames.get(k, []):
-                self._warn("Attempted to override section '%s', which doesn't exist. "
-                           "Ensure that a base section with the same name is loaded "
-                           "first. Check %s, mod file %s" % (k, self.file_name, fname))
-
+        # ВНИМАНИЕ: финального прохода с предупреждениями в движке НЕТ.
+        # 'Attempted to override...' печатается ровно один раз за слэш секции
+        # в StashCurrentSection (Xr_ini.cpp:400-404) — см. выше.
         # cleanup (1402-1419)
         self.override_to_filenames.clear()
         self.section_to_filename.clear()
@@ -826,30 +936,54 @@ class LtxResolver:
         return lo < len(self.data) and self.data[lo][0] == name
 
     def r_section(self, name):
+        """Бинарный поиск по отсортированному Root DATA (xr_strcmp-порядок).
+        Аналог xr_unordered_map::find в движке, но у нас data отсортирован
+        (Xr_ini.cpp:1390-1400 — секции складываются в упорядоченный контейнер).
+        Шаблон идентичен section_exist."""
         name = name.lower()
-        for k, v in self.data:
-            if k == name:
-                return v
-        raise KeyError("Can't open section '%s'" % name)
+        lo, hi = 0, len(self.data)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _xr_strcmp(self.data[mid][0], name) < 0:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(self.data) and self.data[lo][0] == name:
+            return self.data[lo][1]
+        # Движок: CInifile::r_section возвращает NULL при отсутствии секции
+        # (xr_ini.h), а не бросает исключение.
+        return None
 
     def line_exist(self, sec, key):
-        if not self.section_exist(sec):
+        sect = self.r_section(sec)
+        if sect is None:
             return False
-        for it in self.r_section(sec).data:
+        for it in sect.data:
             if it.first == key:
                 return True
         return False
 
     def r_string(self, sec, key):
-        for it in self.r_section(sec).data:
-            if it.first == key:
-                return it.second
+        sect = self.r_section(sec)
+        if sect is not None:
+            for it in sect.data:
+                if it.first == key:
+                    return it.second
         raise KeyError("Cannot find line %s:%s" % (sec, key))
 
     def winner_of(self, sec, key):
-        """Отладковый запрос: какой физический файл дал значение ключа."""
-        return self.r_section(sec) and next(
-            (it.filename for it in self.r_section(sec).data if it.first == key), None)
+        """Отладковый запрос: полный «победитель» ключа.
+        Возвращает кортеж (filename, depth, insertion_index) или None.
+        Соответствует первой записи после SortAndFilterSection
+        (Xr_ini.cpp:410-451: ключ↑, depth↑, insertionIndex↓),
+        т.к. self.data уже отсортирован и дубликаты ключей схлопнуты."""
+        section = self.r_section(sec)
+        if section is None:
+            return None
+        for it in section.data:
+            if it.first == key:
+                return (it.filename, it.depth, it.insertion_index)
+        return None
 
     def as_dict(self):
         out = OrderedDict()
