@@ -189,7 +189,6 @@ class LtxResolver:
         self.override_data = OrderedDict()
         self.override_modify_list_data = {}
 
-        self._mod_phase_pending = True   # фаза mod_* ещё не выполнялась (529-534)
         self.data = []            # финальный Root DATA
         self.warnings = []
         self._cache = {}          # CachedData (Xr_ini.cpp:111)
@@ -241,9 +240,16 @@ class LtxResolver:
         if key:
             op = key[0]
             if op in (">", "<"):
+                # Xr_ini.cpp:235-256 insert_item: запись идёт в Section.data
+                # (push_back с insertionIndex) И дублируется в
+                # OverrideModifyListData (xr_ini.h:214-218). Именно поэтому
+                # SortAndFilterSection (410-451) выбирает победителя среди
+                # всех >key/<key записей по depth, и только ОДНА выжившая
+                # запись доходит до мод-фазы EvaluateSection (1167+).
                 lst = self.override_modify_list_data.setdefault(tgt.name, [])
                 lst.append(item)
                 item.insertion_index = len(lst)
+                tgt.data.append(item)
                 return
         item.insertion_index = len(tgt.data)
         tgt.data.append(item)
@@ -315,8 +321,8 @@ class LtxResolver:
         if not os.path.isfile(fn):
             raise FileNotFoundError("Can't find include file: %s" % name)
         current_file_name[0] = name
-        # bIsRootFile=False: движок передаёт false во всех рекурсиях (330-363);
-        # фаза mod_* управляется флажком run_mod_phase внутри конкретного вызова.
+        # bIsRootFile=False: движок передаёт false во всех рекурсиях loadFile
+        # (Xr_ini.cpp:330-363) — вложенные проходы фазу mod_* НЕ запускают.
         self._ltx_load(fn, inc_path, False, current_file_name, depth)
 
     # ------------------------------------------------------- LTXLoad
@@ -332,20 +338,13 @@ class LtxResolver:
         # уникальные имена в ПОРЯДКЕ первого добавления (flat-set: find+push_back).
         sections_marked_for_create = OrderedDict()
 
-        # Движок (Xr_ini.cpp:529-534): фаза mod_* запускается ОДИН раз на
-        # экземпляре CInifile, только когда EOF достигнут в контексте КОРНЕВОГО
-        # файла (условие bRootFile && !g_pGameLevel && m_file_name.size();
-        # после фазы m_file_name.clear()). Вложенные рекурсии (инклуды из
-        # root и инклюды из модов) НЕ должны запускать её повторно — поэтому
-        # право на фазу хранится во флаге экземпляра self._mod_phase_pending,
-        # который снимается сразу при входе в фазу.
-        # ВАЖНОЕ УТОЧНЕНИЕ (проверено по Xr_ini.cpp:529-534): условие фазы —
-        #  if (bIsRootFile && !g_pGameLevel && m_file_name.size())
-        # т.е. фаза запускается при EOF ЛЮБОГО рекурсивного прохода с
-        # bIsRootFile==true, пока m_file_name непуст; вложенные loadFile идут с
-        # bIsRootFile=false и фазу НЕ запускают. Поэтому флаг привязан к
-        # аргументу b_is_root_file ВЫЗОВА, а не к «контексту» чтения строк.
-        run_mod_phase = b_is_root_file and self._mod_phase_pending
+        # Движок (Xr_ini.cpp:527-543): bHasLoadedModFiles — ЛОКАЛЬНАЯ переменная
+        # прохода LTXLoad, НЕ член класса. Фаза mod_* запускается при EOF любого
+        # прохода с bIsRootFile==true (вложенные loadFile идут с
+        # bIsRootFile=false и фазу не запускают). m_file_name.clear() в движке
+        # выполняется ВНУТРИ _LoadModFiles (Xr_ini.cpp:612) после загрузки всех
+        # модов; если корневое имя уже пусто — фаза пропускается (545-548).
+        b_has_loaded_mod_files = False   # Xr_ini.cpp:~527
         lines = self._read_lines(reader_path)
         i = 0
         n = len(lines)
@@ -353,7 +352,8 @@ class LtxResolver:
         while True:
             # ---- конец файла: для корневого файла запускается фаза mod_* ----
             if i >= n:
-                if run_mod_phase:
+                if b_is_root_file and not b_has_loaded_mod_files:
+                    b_has_loaded_mod_files = True       # Xr_ini.cpp:543
                     self._stash_current_section(current_base, current_override,
                                                 current_file_name[0])
                     current_base = current_override = None
@@ -368,16 +368,18 @@ class LtxResolver:
                             if fname not in fnames:          # std::set insert
                                 fnames.append(fname)
                             self.section_to_filename[sec_name] = fname
-                    if not self.file_name:
-                        break
-                    self._mod_phase_pending = False   # аналог m_file_name.clear()
                     # ВАЖНОЕ СООТВЕТСТВИЕ ДВИЖКУ (Xr_ini.cpp:336-341, 546-556):
                     # loadFile передаёт в LTXLoad свой АРГУМЕНТ path как 'folder'
                     # для поиска mod_*.ltx — НЕ директорию текущего файла.
                     # Поэтому рекурсивный инклуд с b_is_root_file=True
-                    # (#include "dir\\file.ltx" из root, Xr_ini.cpp:716) ищет
-                    # моды в КОРНЕВОЙ папке, а не в dir\.
+                    # (#include "dir\\\\file.ltx" из root, Xr_ini.cpp:716) ищет
+                    # моды в КОРНЕВОЙ папке, а не в dir\\.
+                    # m_file_name.empty() -> skip (Xr_ini.cpp:545-548);
+                    # очистка имени — внутри _load_mod_files (612).
                     self._load_mod_files(current_file_name, path)
+                    # После фазы цикл движка делает continue при F->eof()==true,
+                    # условие while ложно -> переход к финальному слэшу (884+).
+                    break
                 else:
                     pass  # финальный слэш и @[...] — ниже, после цикла
 
@@ -562,7 +564,11 @@ class LtxResolver:
           файла "<root>_*.ltx" в той же папке (чтобы mod_logs_xxx.ltx не
           грузился вместе с system.ltx, когда есть logs.ltx).
         """
-        stem = os.path.splitext(self.file_name)[0].lower()
+        # Xr_ini.cpp:549-561: цикл движка идёт по маске "<m_file_name>_*.ltx"
+        # (шаблон = имя корня + '_' + "*"+расширение). stem в нижний регистр —
+        # как strlwr перед PatternMatch (573-580; имена FS_FileSet хранятся
+        # lower-case, LocatorAPI.cpp:1023).
+        stem = os.path.splitext(current_file_name[0])[0].lower()   # m_file_name (546)
         ambiguous = {os.path.splitext(f)[0]
                      for f in self._file_list(folder, stem + "_*.ltx")}
         mod_files = self._file_list(folder, "mod_" + stem + "_*.ltx")
@@ -627,6 +633,24 @@ class LtxResolver:
             while j < len(sect.data) and sect.data[j].first == k:
                 j += 1
         sect.data = result
+        # Xr_ini.cpp:410-451 действует и на Section.data, и на параллельный
+        # список OverrideModifyListData той же секции (записи >/< дублируются
+        # в оба контейнера — insert_item 235-256). Применяем тот же
+        # sort+keep-first к модификаторам списков.
+        mods = self.override_modify_list_data.get(sect.name)
+        if mods and len(mods) > 1:
+            mods.sort(key=lambda it: (_key(it.first or ""),
+                                      it.depth,
+                                      -it.insertion_index))
+            mres = []
+            j = 0
+            while j < len(mods):
+                k = mods[j].first
+                mres.append(mods[j])
+                j += 1
+                while j < len(mods) and mods[j].first == k:
+                    j += 1
+            self.override_modify_list_data[sect.name] = mres
 
     # --------------------------------------------------- MergeSections
 
